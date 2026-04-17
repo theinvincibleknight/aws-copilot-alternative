@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECS Fargate Backend Service: Task Definition, ECS Service, Target Group,
+  ALB Listener Rules, IAM Roles, Service Discovery, CloudWatch Logs.
+  Deployed per service by developers.
+
+Parameters:
+  AppName:
+    Type: String
+  EnvName:
+    Type: String
+  ServiceName:
+    Type: String
+  Department:
+    Type: String
+    Description: Department tag value (e.g., IT)
+  ContainerImage:
+    Type: String
+    Description: Full ECR image URI with tag
+  ContainerPort:
+    Type: Number
+    Default: 3000
+  TaskCPU:
+    Type: String
+    Default: '512'
+  TaskMemory:
+    Type: String
+    Default: '1024'
+  DesiredCount:
+    Type: Number
+    Default: 1
+  HealthCheckPath:
+    Type: String
+    Default: '/health'
+  RulePath:
+    Type: String
+    Description: "ALB path-based routing (e.g., /api/orders)"
+  HostAlias:
+    Type: String
+    Description: "Host header for ALB routing (e.g., uat.app.example.com)"
+  ListenerRulePriority:
+    Type: Number
+    Description: "Unique listener rule priority (1-50000)"
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  EnableExecuteCommand:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  DeploymentStrategy:
+    Type: String
+    Default: 'rolling'
+    AllowedValues: ['rolling', 'recreate']
+
+  # --- Datadog Sidecar ---
+  EnableDatadogSidecar:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  DatadogApiKeySSMParam:
+    Type: String
+    Default: ''
+    Description: "Full SSM parameter name for Datadog API key"
+  DatadogSite:
+    Type: String
+    Default: 'datadoghq.com'
+
+  # --- Firelens Logging to Datadog ---
+  EnableFirelensLogging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  DatadogLogsHost:
+    Type: String
+    Default: 'http-intake.logs.datadoghq.com'
+  DatadogSource:
+    Type: String
+    Default: 'nodejs'
+
+Conditions:
+  IsRecreate: !Equals [!Ref DeploymentStrategy, 'recreate']
+  UseDatadog: !Equals [!Ref EnableDatadogSidecar, 'true']
+  UseFirelens: !Equals [!Ref EnableFirelensLogging, 'true']
+  UseExecCommand: !Equals [!Ref EnableExecuteCommand, 'true']
+  HasDatadogApiKey: !Not [!Equals [!Ref DatadogApiKeySSMParam, '']]
+
+Resources:
+  # =============================================
+  # CloudWatch Log Group
+  # =============================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${AppName}/${EnvName}/${ServiceName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: service
+          Value: !Ref ServiceName
+        - Key: Department
+          Value: !Ref Department
+
+  # =============================================
+  # IAM: Execution Role
+  # Used by ECS agent to pull images, fetch secrets
+  # =============================================
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${EnvName}-${ServiceName}-exec'
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: service
+          Value: !Ref ServiceName
+        - Key: Department
+          Value: !Ref Department
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Access SSM parameters under /{app}/{env}/secrets/*
+              - Sid: SSMAccess
+                Effect: Allow
+                Action:
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParameter'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/${EnvName}/secrets/*'
+              # Access Secrets Manager (if used)
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/${EnvName}/*'
+              # KMS decrypt for encrypted parameters
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource: '*'
+
+  # =============================================
+  # IAM: Task Role
+  # Used by application code running inside container
+  # =============================================
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${EnvName}-${ServiceName}-task'
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: service
+          Value: !Ref ServiceName
+        - Key: Department
+          Value: !Ref Department
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DenyIAM
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action: 'iam:*'
+                Resource: '*'
+        - PolicyName: ExecuteCommand
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssmmessages:CreateControlChannel'
+                  - 'ssmmessages:OpenControlChannel'
+                  - 'ssmmessages:CreateDataChannel'
+                  - 'ssmmessages:OpenDataChannel'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  # =============================================
+  # ECS Task Definition
+  # =============================================
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Family: !Sub '${AppName}-${EnvName}-${ServiceName}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCPU
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: service
+          Value: !Ref ServiceName
+        - Key: Department
+          Value: !Ref Department
+      ContainerDefinitions:
+        # --- Main Application Container ---
+        - Name: !Ref ServiceName
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration: !If
+            - UseFirelens
+            - LogDriver: awsfirelens
+              Options:
+                Name: datadog
+                Host: !Ref DatadogLogsHost
+                TLS: 'on'
+                compress: gzip
+                dd_service: !Ref ServiceName
+                dd_source: !Ref DatadogSource
+                dd_message_key: log
+                dd_tags: !Sub 'env:${EnvName},source:${DatadogSource}'
+                provider: ecs
+              SecretOptions: !If
+                - HasDatadogApiKey
+                - - Name: apikey
+                    ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DatadogApiKeySSMParam}'
+                - !Ref AWS::NoValue
+            - LogDriver: awslogs
+              Options:
+                awslogs-region: !Ref AWS::Region
+                awslogs-group: !Ref LogGroup
+                awslogs-stream-prefix: app
+
+        # --- Datadog Agent Sidecar ---
+        - !If
+          - UseDatadog
+          - Name: datadog-agent
+            Image: 'public.ecr.aws/datadog/agent:7'
+            Essential: false
+            Environment:
+              - Name: ECS_FARGATE
+                Value: 'true'
+              - Name: DD_SITE
+                Value: !Ref DatadogSite
+            Secrets: !If
+              - HasDatadogApiKey
+              - - Name: DD_API_KEY
+                  ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DatadogApiKeySSMParam}'
+              - !Ref AWS::NoValue
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-region: !Ref AWS::Region
+                awslogs-group: !Ref LogGroup
+                awslogs-stream-prefix: datadog
+          - !Ref AWS::NoValue
+
+        # --- Firelens Log Router ---
+        - !If
+          - UseFirelens
+          - Name: log_router
+            Image: 'public.ecr.aws/aws-observability/aws-for-fluent-bit:stable'
+            Essential: true
+            FirelensConfiguration:
+              Type: fluentbit
+              Options:
+                enable-ecs-log-metadata: 'true'
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-region: !Ref AWS::Region
+                awslogs-group: !Ref LogGroup
+                awslogs-stream-prefix: firelens
+          - !Ref AWS::NoValue
+
+  # =============================================
+  # Service Discovery
+  # =============================================
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: !Sub 'Discovery for ${ServiceName}'
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 10
+            Type: A
+          - TTL: 10
+            Type: SRV
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: !Ref ServiceName
+      NamespaceId:
+        Fn::ImportValue: !Sub '${AppName}-${EnvName}-ServiceDiscoveryNamespaceID'
+
+  # =============================================
+  # ALB Target Group
+  # =============================================
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AppName}-${EnvName}-${ServiceName}'
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 5
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+        - Key: stickiness.enabled
+          Value: 'false'
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub '${AppName}-${EnvName}-VpcId'
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: service
+          Value: !Ref ServiceName
+        - Key: Department
+          Value: !Ref Department
+
+  # =============================================
+  # ALB Listener Rules
+  # =============================================
+
+  # HTTP -> HTTPS redirect
+  HTTPListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            Host: '#{host}'
+            Path: '/#{path}'
+            Query: '#{query}'
+            StatusCode: HTTP_301
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref HostAlias
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - !Ref RulePath
+              - !Sub '${RulePath}/*'
+      ListenerArn:
+        Fn::ImportValue: !Sub '${AppName}-${EnvName}-InternalHTTPListenerArn'
+      Priority: !Ref ListenerRulePriority
+
+  # HTTPS -> Target Group
+  HTTPSListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref HostAlias
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - !Ref RulePath
+              - !Sub '${RulePath}/*'
+      ListenerArn:
+        Fn::ImportValue: !Sub '${AppName}-${EnvName}-InternalHTTPSListenerArn'
+      Priority: !Ref ListenerRulePriority
+
+  # =============================================
+  # ECS Service
+  # =============================================
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HTTPListenerRule
+      - HTTPSListenerRule
+    Properties:
+      ServiceName: !Ref ServiceName
+      PlatformVersion: LATEST
+      Cluster:
+        Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+        MinimumHealthyPercent: !If [IsRecreate, 0, 100]
+        MaximumPercent: !If [IsRecreate, 100, 200]
+      PropagateTags: SERVICE
+      EnableExecuteCommand: !If [UseExecCommand, true, false]
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            Fn::Split:
+              - ','
+              - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PrivateSubnets'
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${AppName}-${EnvName}-EnvironmentSecurityGroup'
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          Port: !Ref ContainerPort
+      HealthCheckGracePeriodSeconds: 60
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: service
+          Value: !Ref ServiceName
+        - Key: Department
+          Value: !Ref Department
+
+Outputs:
+  ServiceArn:
+    Description: ECS Service ARN
+    Value: !Ref ECSService
+  ServiceName:
+    Description: ECS Service Name
+    Value: !Ref ServiceName
+  TargetGroupArn:
+    Description: Target Group ARN
+    Value: !Ref TargetGroup
+  DiscoveryServiceArn:
+    Description: Service Discovery ARN
+    Value: !GetAtt DiscoveryService.Arn
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-${ServiceName}-DiscoveryServiceARN'
+  TaskDefinitionArn:
+    Description: Task Definition ARN
+    Value: !Ref TaskDefinition
+  ServiceUrl:
+    Description: Service URL via internal ALB
+    Value: !Sub
+      - 'https://${Alias}${Path}'
+      - Alias: !Ref HostAlias
+        Path: !Ref RulePath

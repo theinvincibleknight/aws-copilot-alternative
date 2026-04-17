@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Environment infrastructure: ECS Cluster, Internal ALB with HTTPS,
+  Security Groups, Service Discovery namespace.
+  Run once per environment by admins.
+
+Parameters:
+  AppName:
+    Type: String
+    Description: Application name (e.g., myapp)
+  EnvName:
+    Type: String
+    Description: Environment name (e.g., uat, prod)
+  Department:
+    Type: String
+    Description: Department tag value (e.g., IT)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs (comma-separated)
+  CertificateArn:
+    Type: String
+    Description: ACM Certificate ARN for HTTPS on internal ALB
+  EnableContainerInsights:
+    Type: String
+    Default: 'disabled'
+    AllowedValues: [enabled, disabled]
+
+Resources:
+  # =============================================
+  # ECS Cluster
+  # =============================================
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AppName}-${EnvName}'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !Ref EnableContainerInsights
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: Department
+          Value: !Ref Department
+
+  # =============================================
+  # Service Discovery (private DNS namespace)
+  # Services register here for internal communication
+  # e.g., service-name.uat.myapp.local
+  # =============================================
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub '${EnvName}.${AppName}.local'
+      Vpc: !Ref VpcId
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: Department
+          Value: !Ref Department
+
+  # =============================================
+  # Security Groups
+  # =============================================
+
+  # SG for the Internal ALB
+  InternalALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Internal ALB for ${AppName}-${EnvName}'
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-${EnvName}-internal-alb'
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: Department
+          Value: !Ref Department
+
+  # SG for ECS tasks/containers
+  EnvironmentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AppName}-${EnvName} ECS tasks security group'
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-${EnvName}-ecs-tasks'
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: Department
+          Value: !Ref Department
+
+  # Internal ALB -> ECS tasks (all traffic)
+  ECSIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow all traffic from internal ALB to ECS tasks
+      GroupId: !Ref EnvironmentSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref InternalALBSecurityGroup
+
+  # ECS tasks -> ECS tasks (inter-service communication)
+  ECSIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow inter-container communication
+      GroupId: !Ref EnvironmentSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EnvironmentSecurityGroup
+
+  # ECS tasks -> Internal ALB (for service-to-service via ALB)
+  ALBIngressFromECS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow ECS tasks to reach internal ALB
+      GroupId: !Ref InternalALBSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EnvironmentSecurityGroup
+
+  # =============================================
+  # Internal Application Load Balancer
+  # Network team maps this to internet-facing LB
+  # =============================================
+  InternalLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AppName}-${EnvName}-int'
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !GetAtt InternalALBSecurityGroup.GroupId
+      Subnets: !Ref PrivateSubnetIds
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: Department
+          Value: !Ref Department
+
+  # Default target group (placeholder, no real targets)
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 5
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+      TargetType: ip
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: environment
+          Value: !Ref EnvName
+        - Key: Department
+          Value: !Ref Department
+
+  # HTTP listener (port 80) - services can add redirect rules
+  InternalHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref DefaultTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref InternalLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # HTTPS listener (port 443) - services add forward rules here
+  InternalHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - TargetGroupArn: !Ref DefaultTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref InternalLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+
+  # =============================================
+  # CloudWatch Log Resource Policy
+  # =============================================
+  LogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${AppName}-${EnvName}-LogPolicy'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["delivery.logs.amazonaws.com"]
+              },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": ["arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${AppName}/${EnvName}/*:log-stream:*"],
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-VpcId'
+  PrivateSubnets:
+    Value: !Join [',', !Ref PrivateSubnetIds]
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-PrivateSubnets'
+  ClusterId:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-ClusterId'
+  ClusterName:
+    Value: !Sub '${AppName}-${EnvName}'
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-ClusterName'
+  ServiceDiscoveryNamespaceID:
+    Value: !GetAtt ServiceDiscoveryNamespace.Id
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-ServiceDiscoveryNamespaceID'
+  ServiceDiscoveryDomain:
+    Value: !Sub '${EnvName}.${AppName}.local'
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-ServiceDiscoveryDomain'
+  EnvironmentSecurityGroup:
+    Value: !Ref EnvironmentSecurityGroup
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-EnvironmentSecurityGroup'
+  InternalALBSecurityGroup:
+    Value: !Ref InternalALBSecurityGroup
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-InternalALBSecurityGroup'
+  InternalLoadBalancerDNS:
+    Description: Internal ALB DNS - provide this to network team for internet-facing LB mapping
+    Value: !GetAtt InternalLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-InternalLoadBalancerDNS'
+  InternalLoadBalancerHostedZoneId:
+    Value: !GetAtt InternalLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-InternalLoadBalancerHostedZoneId'
+  InternalHTTPListenerArn:
+    Value: !Ref InternalHTTPListener
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-InternalHTTPListenerArn'
+  InternalHTTPSListenerArn:
+    Value: !Ref InternalHTTPSListener
+    Export:
+      Name: !Sub '${AppName}-${EnvName}-InternalHTTPSListenerArn'

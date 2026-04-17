@@ -1,0 +1,52 @@
+# Service Manifest File
+# Developers create this in their project root as "manifest.yml"
+#
+# SSM secrets path convention: /{app}/{env}/secrets/{SECRET_NAME}
+# Example: /myapp/uat/secrets/DB_PASSWORD
+
+app: myapp
+service: order-service
+department: IT
+port: 3000
+path: /api/orders
+healthcheck: /api/orders/health
+dockerfile: Dockerfile
+listener_rule_priority: 10
+
+# Datadog integration (optional, remove if not needed)
+datadog:
+  enabled: true
+  api_key_ssm: myapp/${ENV}/secrets/DATADOG_API_KEY
+  site: datadoghq.com
+  firelens:
+    enabled: true
+    host: http-intake.logs.datadoghq.com
+    source: nodejs
+
+# Per-environment overrides
+environments:
+  uat:
+    alias: uat.app.example.com
+    cpu: 2048
+    memory: 4096
+    count: 1
+    deployment: recreate
+    variables:
+      AWS_REGION: ap-south-1
+      PORTAL_URL: https://uat.app.example.com/portal/login
+      MYSQL_DATABASE_HOST: 10.0.1.100
+    secrets:
+      DB_USERNAME: /myapp/uat/secrets/APP_DB_USERNAME
+      DB_PASSWORD: /myapp/uat/secrets/APP_DB_PASSWORD
+
+  prod:
+    alias: prod.app.example.com
+    cpu: 2048
+    memory: 4096
+    count: 1
+    deployment: rolling
+    variables:
+      AWS_REGION: ap-south-1
+    secrets:
+      DB_USERNAME: /myapp/prod/secrets/APP_DB_USERNAME
+      DB_PASSWORD: /myapp/prod/secrets/APP_DB_PASSWORD

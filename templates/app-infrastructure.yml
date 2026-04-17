@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Application-level infrastructure: IAM roles for CloudFormation execution,
+  KMS key for artifact encryption, S3 bucket for artifacts.
+  Run once per application by admins.
+
+Parameters:
+  AppName:
+    Type: String
+    Description: Application name (e.g., myapp)
+  Department:
+    Type: String
+    Description: Department tag value (e.g., IT)
+
+Resources:
+  # --- IAM: CloudFormation Execution Role ---
+  # Used by CloudFormation to create/update service stacks
+  CFNExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-cfn-execution'
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: Department
+          Value: !Ref Department
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CFNExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                NotAction:
+                  - 'organizations:*'
+                  - 'account:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'organizations:DescribeOrganization'
+                  - 'account:ListRegions'
+                Resource: '*'
+
+  # --- IAM: Deploy Role ---
+  # Assumed by deploy script / CI to manage stacks, ECR, ECS
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-deploy'
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: Department
+          Value: !Ref Department
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: DeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:Describe*'
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:GetTemplate'
+                  - 'cloudformation:GetTemplateSummary'
+                  - 'cloudformation:ListStacks'
+                Resource: '*'
+              - Sid: ECR
+                Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:PutImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:ListImages'
+                Resource: '*'
+              - Sid: ECS
+                Effect: Allow
+                Action:
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTasks'
+                  - 'ecs:DescribeClusters'
+                  - 'ecs:UpdateService'
+                  - 'ecs:ListServices'
+                  - 'ecs:ListTasks'
+                  - 'ecs:ExecuteCommand'
+                  - 'ecs:RunTask'
+                  - 'ecs:StopTask'
+                  - 'ecs:DescribeTaskDefinition'
+                Resource: '*'
+              - Sid: SSM
+                Effect: Allow
+                Action:
+                  - 'ssm:PutParameter'
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:AddTagsToResource'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*'
+              - Sid: IAMPassRole
+                Effect: Allow
+                Action:
+                  - 'iam:GetRole'
+                  - 'iam:PassRole'
+                Resource:
+                  - !GetAtt CFNExecutionRole.Arn
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - 'logs:GetLogEvents'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:FilterLogEvents'
+                Resource: '*'
+
+  # --- KMS Key for Artifact Encryption ---
+  ArtifactKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Encryption key for ${AppName} deployment artifacts'
+      EnableKeyRotation: true
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: Department
+          Value: !Ref Department
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: !Sub '${AppName}-artifact-key'
+        Statement:
+          - Sid: AllowKeyAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  ArtifactKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AppName}-artifact-key'
+      TargetKeyId: !Ref ArtifactKey
+
+  # --- S3 Bucket for Artifacts ---
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AppName}-deploy-artifacts-${AWS::AccountId}'
+      Tags:
+        - Key: app
+          Value: !Ref AppName
+        - Key: Department
+          Value: !Ref Department
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt ArtifactKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceHTTPS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ArtifactBucket.Arn}'
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+Outputs:
+  CFNExecutionRoleArn:
+    Description: CloudFormation execution role ARN
+    Value: !GetAtt CFNExecutionRole.Arn
+    Export:
+      Name: !Sub '${AppName}-CFNExecutionRoleArn'
+  DeployRoleArn:
+    Description: Deploy role ARN for CI/CD or manual deploys
+    Value: !GetAtt DeployRole.Arn
+    Export:
+      Name: !Sub '${AppName}-DeployRoleArn'
+  ArtifactKeyArn:
+    Description: KMS Key ARN for artifact encryption
+    Value: !GetAtt ArtifactKey.Arn
+    Export:
+      Name: !Sub '${AppName}-ArtifactKeyArn'
+  ArtifactBucketName:
+    Description: S3 bucket for deployment artifacts
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub '${AppName}-ArtifactBucket'
